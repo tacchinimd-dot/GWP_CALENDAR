@@ -302,6 +302,7 @@ initDB().then(() => {
     console.log(`ST 에코백 캘린더 서버 실행 중: http://0.0.0.0:${PORT}`);
   });
 }).catch(err => {
-  console.error('DB 초기화 실패:', err.message);
+  console.error('DB 초기화 실패:', err.message, err.stack);
+  console.error('DATABASE_URL:', process.env.DATABASE_URL ? '설정됨 (' + process.env.DATABASE_URL.substring(0, 30) + '...)' : '미설정');
   process.exit(1);
 });
