@@ -1,0 +1,12 @@
+{
+  "name": "st-ecobag-calendar",
+  "version": "1.0.0",
+  "description": "ST 에코백 사은품 진행 상황 공유 캘린더",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
