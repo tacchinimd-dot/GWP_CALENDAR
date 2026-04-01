@@ -1,37 +1,55 @@
 const express = require('express');
-const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'calendar-data.json');
+
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('render.com') ? { rejectUnauthorized: false } : false
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize data file
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.error('Data load error:', e.message);
-  }
-  return { notes: {}, current: [], upcoming: [], users: {} };
-}
-
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
-}
-
-// Ensure data dir exists
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-if (!fs.existsSync(DATA_FILE)) {
-  saveData({ notes: {}, current: [], upcoming: [], users: {} });
+// Initialize database tables
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      ip TEXT,
+      last_access TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      day_key TEXT NOT NULL,
+      text TEXT NOT NULL,
+      start_date TEXT DEFAULT '',
+      end_date TEXT DEFAULT '',
+      author TEXT DEFAULT '알 수 없음',
+      author_id TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL CHECK (type IN ('current', 'upcoming')),
+      text TEXT NOT NULL,
+      start_date TEXT DEFAULT '',
+      end_date TEXT DEFAULT '',
+      done BOOLEAN DEFAULT FALSE,
+      author TEXT DEFAULT '알 수 없음',
+      author_id TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  console.log('DB 테이블 초기화 완료');
 }
 
 // Get client IP
@@ -42,161 +60,248 @@ function getClientIP(req) {
 // --- API Routes ---
 
 // Register / identify user
-app.post('/api/register', (req, res) => {
-  const { name } = req.body;
-  if (!name || !name.trim()) return res.status(400).json({ error: '이름을 입력해주세요.' });
+app.post('/api/register', async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: '이름을 입력해주세요.' });
 
-  const ip = getClientIP(req);
-  const data = loadData();
-  const userId = `user_${ip.replace(/[.:]/g, '_')}`;
+    const ip = getClientIP(req);
+    const userId = `user_${ip.replace(/[.:]/g, '_')}`;
 
-  data.users[userId] = {
-    name: name.trim(),
-    ip,
-    lastAccess: new Date().toISOString()
-  };
-  saveData(data);
+    await pool.query(
+      `INSERT INTO users (user_id, name, ip, last_access) VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET name = $2, last_access = NOW()`,
+      [userId, name.trim(), ip]
+    );
 
-  res.json({ userId, name: name.trim(), ip });
+    res.json({ userId, name: name.trim(), ip });
+  } catch (e) {
+    console.error('Register error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Get current user by IP
-app.get('/api/me', (req, res) => {
-  const ip = getClientIP(req);
-  const data = loadData();
-  const userId = `user_${ip.replace(/[.:]/g, '_')}`;
-  const user = data.users[userId];
+app.get('/api/me', async (req, res) => {
+  try {
+    const ip = getClientIP(req);
+    const userId = `user_${ip.replace(/[.:]/g, '_')}`;
 
-  if (user) {
-    // Update last access
-    data.users[userId].lastAccess = new Date().toISOString();
-    saveData(data);
-    res.json({ userId, name: user.name, ip });
-  } else {
-    res.json({ userId: null, name: null, ip });
+    const result = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    if (result.rows.length > 0) {
+      await pool.query('UPDATE users SET last_access = NOW() WHERE user_id = $1', [userId]);
+      res.json({ userId, name: result.rows[0].name, ip });
+    } else {
+      res.json({ userId: null, name: null, ip });
+    }
+  } catch (e) {
+    console.error('Me error:', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 // Get all registered users
-app.get('/api/users', (req, res) => {
-  const data = loadData();
-  const users = Object.entries(data.users).map(([id, u]) => ({
-    id, name: u.name, lastAccess: u.lastAccess
-  }));
-  res.json(users);
+app.get('/api/users', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT user_id as id, name, last_access FROM users ORDER BY last_access DESC');
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Get all calendar data
-app.get('/api/data', (req, res) => {
-  const data = loadData();
-  res.json({ notes: data.notes, current: data.current, upcoming: data.upcoming });
+app.get('/api/data', async (req, res) => {
+  try {
+    const notesResult = await pool.query('SELECT * FROM notes ORDER BY created_at');
+    const currentResult = await pool.query("SELECT * FROM tasks WHERE type = 'current' ORDER BY created_at");
+    const upcomingResult = await pool.query("SELECT * FROM tasks WHERE type = 'upcoming' ORDER BY created_at");
+
+    // Group notes by day_key
+    const notes = {};
+    notesResult.rows.forEach(n => {
+      if (!notes[n.day_key]) notes[n.day_key] = [];
+      notes[n.day_key].push({
+        text: n.text, start: n.start_date, end: n.end_date,
+        author: n.author, authorId: n.author_id, createdAt: n.created_at
+      });
+    });
+
+    const mapTask = t => ({
+      id: t.id, text: t.text, start: t.start_date, end: t.end_date,
+      done: t.done, author: t.author, authorId: t.author_id, createdAt: t.created_at
+    });
+
+    res.json({
+      notes,
+      current: currentResult.rows.map(mapTask),
+      upcoming: upcomingResult.rows.map(mapTask)
+    });
+  } catch (e) {
+    console.error('Data error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Add note to a day
-app.post('/api/notes', (req, res) => {
-  const { dayKey, text, start, end, userId, userName } = req.body;
-  if (!dayKey || !text) return res.status(400).json({ error: '필수 항목 누락' });
+app.post('/api/notes', async (req, res) => {
+  try {
+    const { dayKey, text, start, end, userId, userName } = req.body;
+    if (!dayKey || !text) return res.status(400).json({ error: '필수 항목 누락' });
 
-  const data = loadData();
-  if (!data.notes[dayKey]) data.notes[dayKey] = [];
-  data.notes[dayKey].push({
-    text,
-    start: start || '',
-    end: end || '',
-    author: userName || '알 수 없음',
-    authorId: userId || '',
-    createdAt: new Date().toISOString()
-  });
-  saveData(data);
-  res.json({ success: true, notes: data.notes });
-});
+    await pool.query(
+      'INSERT INTO notes (day_key, text, start_date, end_date, author, author_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [dayKey, text, start || '', end || '', userName || '알 수 없음', userId || '']
+    );
 
-// Delete note from a day
-app.delete('/api/notes/:dayKey/:index', (req, res) => {
-  const { dayKey, index } = req.params;
-  const data = loadData();
-  if (data.notes[dayKey] && data.notes[dayKey][+index] !== undefined) {
-    data.notes[dayKey].splice(+index, 1);
-    if (data.notes[dayKey].length === 0) delete data.notes[dayKey];
-    saveData(data);
+    // Return updated notes
+    const notesResult = await pool.query('SELECT * FROM notes ORDER BY created_at');
+    const notes = {};
+    notesResult.rows.forEach(n => {
+      if (!notes[n.day_key]) notes[n.day_key] = [];
+      notes[n.day_key].push({
+        text: n.text, start: n.start_date, end: n.end_date,
+        author: n.author, authorId: n.author_id, createdAt: n.created_at
+      });
+    });
+
+    res.json({ success: true, notes });
+  } catch (e) {
+    console.error('Note add error:', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
-  res.json({ success: true, notes: data.notes });
 });
 
-// Add task (current or upcoming)
-app.post('/api/tasks/:type', (req, res) => {
-  const { type } = req.params;
-  if (type !== 'current' && type !== 'upcoming') return res.status(400).json({ error: 'Invalid type' });
+// Delete note
+app.delete('/api/notes/:dayKey/:index', async (req, res) => {
+  try {
+    const { dayKey, index } = req.params;
 
-  const { text, start, end, userId, userName } = req.body;
-  if (!text) return res.status(400).json({ error: '제목을 입력해주세요.' });
+    // Get the specific note by day_key and index
+    const notesForDay = await pool.query(
+      'SELECT id FROM notes WHERE day_key = $1 ORDER BY created_at', [dayKey]
+    );
+    if (notesForDay.rows[+index]) {
+      await pool.query('DELETE FROM notes WHERE id = $1', [notesForDay.rows[+index].id]);
+    }
 
-  const data = loadData();
-  data[type].push({
-    text,
-    start: start || '',
-    end: end || '',
-    done: false,
-    id: Date.now(),
-    author: userName || '알 수 없음',
-    authorId: userId || '',
-    createdAt: new Date().toISOString()
-  });
-  saveData(data);
-  res.json({ success: true, current: data.current, upcoming: data.upcoming });
+    // Return updated notes
+    const notesResult = await pool.query('SELECT * FROM notes ORDER BY created_at');
+    const notes = {};
+    notesResult.rows.forEach(n => {
+      if (!notes[n.day_key]) notes[n.day_key] = [];
+      notes[n.day_key].push({
+        text: n.text, start: n.start_date, end: n.end_date,
+        author: n.author, authorId: n.author_id, createdAt: n.created_at
+      });
+    });
+
+    res.json({ success: true, notes });
+  } catch (e) {
+    console.error('Note delete error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Add task
+app.post('/api/tasks/:type', async (req, res) => {
+  try {
+    const { type } = req.params;
+    if (type !== 'current' && type !== 'upcoming') return res.status(400).json({ error: 'Invalid type' });
+
+    const { text, start, end, userId, userName } = req.body;
+    if (!text) return res.status(400).json({ error: '제목을 입력해주세요.' });
+
+    await pool.query(
+      'INSERT INTO tasks (type, text, start_date, end_date, author, author_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [type, text, start || '', end || '', userName || '알 수 없음', userId || '']
+    );
+
+    const currentResult = await pool.query("SELECT * FROM tasks WHERE type = 'current' ORDER BY created_at");
+    const upcomingResult = await pool.query("SELECT * FROM tasks WHERE type = 'upcoming' ORDER BY created_at");
+    const mapTask = t => ({
+      id: t.id, text: t.text, start: t.start_date, end: t.end_date,
+      done: t.done, author: t.author, authorId: t.author_id, createdAt: t.created_at
+    });
+
+    res.json({ success: true, current: currentResult.rows.map(mapTask), upcoming: upcomingResult.rows.map(mapTask) });
+  } catch (e) {
+    console.error('Task add error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Toggle task done
-app.patch('/api/tasks/:type/:id', (req, res) => {
-  const { type, id } = req.params;
-  const data = loadData();
-  const item = data[type]?.find(t => t.id === +id);
-  if (item) {
-    item.done = !item.done;
-    saveData(data);
+app.patch('/api/tasks/:type/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('UPDATE tasks SET done = NOT done WHERE id = $1', [+id]);
+
+    const currentResult = await pool.query("SELECT * FROM tasks WHERE type = 'current' ORDER BY created_at");
+    const upcomingResult = await pool.query("SELECT * FROM tasks WHERE type = 'upcoming' ORDER BY created_at");
+    const mapTask = t => ({
+      id: t.id, text: t.text, start: t.start_date, end: t.end_date,
+      done: t.done, author: t.author, authorId: t.author_id, createdAt: t.created_at
+    });
+
+    res.json({ success: true, current: currentResult.rows.map(mapTask), upcoming: upcomingResult.rows.map(mapTask) });
+  } catch (e) {
+    console.error('Task toggle error:', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
-  res.json({ success: true, current: data.current, upcoming: data.upcoming });
 });
 
 // Delete task
-app.delete('/api/tasks/:type/:id', (req, res) => {
-  const { type, id } = req.params;
-  const data = loadData();
-  data[type] = (data[type] || []).filter(t => t.id !== +id);
-  saveData(data);
-  res.json({ success: true, current: data.current, upcoming: data.upcoming });
+app.delete('/api/tasks/:type/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM tasks WHERE id = $1', [+id]);
+
+    const currentResult = await pool.query("SELECT * FROM tasks WHERE type = 'current' ORDER BY created_at");
+    const upcomingResult = await pool.query("SELECT * FROM tasks WHERE type = 'upcoming' ORDER BY created_at");
+    const mapTask = t => ({
+      id: t.id, text: t.text, start: t.start_date, end: t.end_date,
+      done: t.done, author: t.author, authorId: t.author_id, createdAt: t.created_at
+    });
+
+    res.json({ success: true, current: currentResult.rows.map(mapTask), upcoming: upcomingResult.rows.map(mapTask) });
+  } catch (e) {
+    console.error('Task delete error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// Activity log (recent changes)
-app.get('/api/activity', (req, res) => {
-  const data = loadData();
-  const activities = [];
+// Activity log
+app.get('/api/activity', async (req, res) => {
+  try {
+    const notesResult = await pool.query('SELECT day_key, text, author, created_at FROM notes ORDER BY created_at DESC LIMIT 30');
+    const tasksResult = await pool.query('SELECT type, text, author, created_at FROM tasks ORDER BY created_at DESC LIMIT 30');
 
-  // Collect from notes
-  Object.entries(data.notes).forEach(([day, notes]) => {
-    notes.forEach(n => {
+    const activities = [];
+    notesResult.rows.forEach(n => {
+      activities.push({ type: 'note', day: n.day_key, text: n.text, author: n.author, createdAt: n.created_at });
+    });
+    tasksResult.rows.forEach(t => {
       activities.push({
-        type: 'note', day, text: n.text, author: n.author,
-        createdAt: n.createdAt
+        type: t.type === 'current' ? '진행중' : '예정',
+        text: t.text, author: t.author, createdAt: t.created_at
       });
     });
-  });
 
-  // Collect from tasks
-  ['current', 'upcoming'].forEach(type => {
-    (data[type] || []).forEach(t => {
-      activities.push({
-        type: type === 'current' ? '진행중' : '예정',
-        text: t.text, author: t.author, createdAt: t.createdAt
-      });
-    });
-  });
-
-  // Sort by date desc, limit 30
-  activities.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-  res.json(activities.slice(0, 30));
+    activities.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json(activities.slice(0, 30));
+  } catch (e) {
+    console.error('Activity error:', e.message);
+    res.json([]);
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`ST 에코백 캘린더 서버 실행 중: http://0.0.0.0:${PORT}`);
+// Start server
+initDB().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`ST 에코백 캘린더 서버 실행 중: http://0.0.0.0:${PORT}`);
+  });
+}).catch(err => {
+  console.error('DB 초기화 실패:', err.message);
+  process.exit(1);
 });
